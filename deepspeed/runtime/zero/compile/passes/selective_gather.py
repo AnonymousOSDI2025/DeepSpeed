@@ -100,6 +100,10 @@ def selective_gather(graph: Graph, graph_id: int, graph_order: List[int], profil
 
     accelerator = get_accelerator()
     total_mem = accelerator.total_memory()
+    vals_to_bcast = torch.tensor([total_mem], device=torch.device(get_accelerator().current_device()))
+    dist.all_reduce(vals_to_bcast, dist.ReduceOp.MIN)
+    total_mem = vals_to_bcast[0].item()
+
     MEM_MARGIN = 0.1
     available_mem = total_mem * (1 - MEM_MARGIN) - peak_mem
 

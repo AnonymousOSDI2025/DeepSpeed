@@ -120,6 +120,7 @@ public:
     {
         grad_buffer.zero_();
         params_.emplace(ds_id, DSParam(ds_id, ds_shape, ds_tensor, grad_buffer, persistent));
+        valid_[ds_id] = false;
     }
 
     void registerGatheredParam(long ds_id, at::Tensor ds_tensor)
@@ -131,6 +132,7 @@ public:
     {
         assert(hasKey(gathered_params_, ds_id));
         gathered_params_.erase(ds_id);
+        valid_[ds_id] = false;
     }
 
     const std::unordered_map<long, DSParam>& getParams() const { return params_; }
@@ -145,9 +147,17 @@ public:
     bool hasGatheredParam(long ds_id) const { return hasKey(gathered_params_, ds_id); }
     void setPersistent(long ds_id, bool persistent) { params_.at(ds_id).setPersistent(persistent); }
 
+    void setValid(long ds_id, bool valid) { valid_[ds_id] = valid; }
+    bool isValid(long ds_id) const
+    {
+        assert(hasKey(valid_, ds_id));
+        return valid_.at(ds_id);
+    }
+
 private:
     std::unordered_map<long, DSParam> params_;
     std::unordered_map<long, at::Tensor> gathered_params_;
+    std::unordered_map<long, bool> valid_;
 };
 
 class ReduceTask {
@@ -324,7 +334,6 @@ public:
     {
         for (long ds_id : ds_ids_) {
             has_acc_grad_[ds_id] = false;
-            valid_[ds_id] = false;
 
             ag_comm_done_events_[ds_id] =
                 std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
@@ -354,8 +363,10 @@ public:
     void endBackward()
     {
         if (param_updated_) {
-            for (auto& it : has_acc_grad_) { it.second = false; }
-            for (auto& it : valid_) { it.second = false; }
+            for (auto& it : has_acc_grad_) {
+                it.second = false;
+                param_registry_->setValid(it.first, false);
+            }
         }
 
         for (auto& it : reload_buffers_) {
@@ -401,14 +412,13 @@ public:
         }
 
         param_registry_->registerGatheredParam(ds_id, output_buf);
-        valid_[ds_id] = true;
+        param_registry_->setValid(ds_id, true);
     }
 
     at::Tensor allgatherParam(long ds_id,
                               c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
     {
-        assert(hasKey(valid_, ds_id));
-        if (valid_.at(ds_id)) { return param_registry_->getGatheredParam(ds_id); }
+        if (param_registry_->isValid(ds_id)) { return param_registry_->getGatheredParam(ds_id); }
 
         const DSParam& param = param_registry_->getParam(ds_id);
         const at::Tensor& ds_tensor = param.getDSTensor();
@@ -416,6 +426,7 @@ public:
                                     ? param_registry_->getGatheredParam(ds_id)
                                     : torch::empty(param.getShape(), ds_tensor.options());
 
+        assert(hasKey(ag_comp_done_events_, ds_id));
         ag_comp_done_events_[ds_id]->record();
         ag_comp_done_events_[ds_id]->block(ag_stream_);
 
@@ -430,8 +441,7 @@ public:
     {
         std::vector<int64_t> invalid_ds_ids;
         for (const auto& ds_id : ds_ids) {
-            assert(hasKey(valid_, ds_id));
-            if (!valid_.at(ds_id)) { invalid_ds_ids.push_back(ds_id); }
+            if (!param_registry_->isValid(ds_id)) { invalid_ds_ids.push_back(ds_id); }
         }
 
         std::unordered_map<long, at::Tensor> output_bufs;
@@ -473,7 +483,6 @@ public:
             }
 
             param_registry_->unregisterGatheredParam(ds_id);
-            valid_[ds_id] = false;
         }
 
         return v;
@@ -631,10 +640,7 @@ public:
 
     bool hasReloadBuffer(long id) { return hasKey(reload_buffers_, id); }
 
-    void invalidateGatheredParam(long ds_id)
-    {
-        if (hasKey(valid_, ds_id)) { valid_[ds_id] = false; }
-    }
+    bool hasParam(long ds_id) const { return hasKey(has_acc_grad_, ds_id); }
 
 private:
     c10::intrusive_ptr<c10d::ProcessGroup> process_group_;
@@ -666,7 +672,6 @@ private:
     bool param_updated_ = false;
     std::unordered_map<at::ScalarType, std::vector<ReduceTask>> reduce_tasks_;
     std::unordered_map<long, bool> has_acc_grad_;
-    std::unordered_map<long, bool> valid_;
     bool pre_div_reduce_;
 
     void flushReduceBucket(at::ScalarType scalar_type)
@@ -886,11 +891,21 @@ void register_param(long ds_id,
     if (persistent) { param_registry->registerGatheredParam(ds_id, ds_tensor); }
 }
 
-void set_persistent(long ds_id) { param_registry->setPersistent(ds_id, true); }
-
 at::Tensor allgather_param(at::Tensor param_tensor, long graph_id, long ds_id)
 {
+    assert(hasKey(executors, graph_id));
     return executors[graph_id]->allgatherParam(ds_id, symm_mem);
+}
+
+void set_persistent(long ds_id)
+{
+    param_registry->setPersistent(ds_id, true);
+
+    // Allocate buffer here
+    // Memory fragmentation will be more severe if we allocate in forward/backward
+    for (auto& it : executors) {
+        if (it.second->hasParam(ds_id)) { it.second->allgatherParam(ds_id, symm_mem); }
+    }
 }
 
 void prefetch_params_fused(long graph_id,
@@ -908,8 +923,6 @@ void invalidate_gathered_param(long ds_id)
 
     param_registry->unregisterGatheredParam(ds_id);
     param_registry->registerGatheredParam(ds_id, at::Tensor());
-
-    for (auto& it : executors) { it.second->invalidateGatheredParam(ds_id); }
 }
 
 void clear_all_gathered_params()
@@ -920,7 +933,6 @@ void clear_all_gathered_params()
         if (param.isPersistent()) { continue; }
         if (param_registry->hasGatheredParam(ds_id)) {
             param_registry->unregisterGatheredParam(ds_id);
-            for (auto& it : executors) { it.second->invalidateGatheredParam(ds_id); }
         }
     }
 }
@@ -1028,10 +1040,10 @@ void start_backward(bool update)
     for (auto& it : executors) { it.second->startBackward(update); }
 }
 
-void end_backward()
-{
-    for (auto& it : executors) { it.second->endBackward(); }
-}
+// We don't call this
+// void end_backward(bool update)
+// {
+// }
 
 at::Tensor test_call(at::Tensor a)
 {
@@ -1116,7 +1128,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("start_forward", &n3z::start_forward, "Start forward pass");
     m.def("end_forward", &n3z::end_forward, "End forward pass");
     m.def("start_backward", &n3z::start_backward, "Start backward pass");
-    m.def("end_backward", &n3z::end_backward, "End backward pass");
+    // m.def("end_backward", &n3z::end_backward, "End backward pass");
     m.def("reset", &n3z::reset, "Reset the state");
     m.def(
         "invalidate_gathered_param", &n3z::invalidate_gathered_param, "Invalidate gathered param");
